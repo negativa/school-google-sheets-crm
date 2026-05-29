@@ -1,50 +1,88 @@
+/**
+ * Refactored Google Apps Script for creating subject journal sheets.
+ *
+ * Main idea:
+ * - Subjects come from the "Предмети" sheet.
+ * - Students come from the "Students list" sheet.
+ * - Student block templates come from the "Template" sheet by subject Group.
+ * - "Маппінг предметів" is not used.
+ */
+
 const CONFIG = {
-  TEMPLATE_SHEET_NAME: 'Template',
-  STUDENTS_SHEET_NAME: 'Students list',
-  SUBJECTS_SHEET_NAME: 'Предмети',
-
-  TEMPLATE_TITLE_TEXT: 'Назва предмету',
-  TOTAL_LABEL: 'Загальна оцінка',
-
-  LOG_SHEET_NAME: 'LOG_ЖУРНАЛИ',
-
-  CLEAR_GRADE_VALUES: true,
-
-  TEMPLATE_MARKERS: {
-    STUDENT_ID: 'STUDENT_ID',
-    CLASS: 'CLASS',
-    NAME: 'NAME',
-    DESCRIPTION: 'DESCRIPTION'
+  SHEETS: {
+    TEMPLATE: 'Template',
+    STUDENTS: 'Students list',
+    SUBJECTS: 'Предмети',
+    LOG: 'LOG_ЖУРНАЛИ'
   },
 
-  SUBJECT_HEADERS: {
-    JOURNAL_SUBJECT: [
-      'назва предмету ua',
-      'предмет в журналі',
-      'предмет'
-    ],
-    CERTIFICATE_SUBJECT: [
-      'назва предмету в свідоцтві',
-      'предмет в свідоцтві'
-    ],
-    GROUP: [
-      'group',
-      'група',
-      'освітня галузь'
-    ]
+  UI: {
+    MENU: 'Журнали',
+    CREATE: 'Створити вкладки з Предмети',
+    RECREATE: 'Пересоздати вкладки з Предмети'
+  },
+
+  TEMPLATE: {
+    TITLE_TEXT: 'Назва предмету',
+    TOTAL_LABEL: 'Загальна оцінка',
+    CLEAR_GRADE_VALUES: true,
+
+    MARKERS: {
+      STUDENT_ID: 'STUDENT_ID',
+      CLASS: 'CLASS',
+      NAME: 'NAME',
+      DESCRIPTION: 'DESCRIPTION'
+    }
+  },
+
+  HEADERS: {
+    SUBJECTS: {
+      JOURNAL_SUBJECT: [
+        'назва предмету ua',
+        'предмет в журналі',
+        'предмет'
+      ],
+      CERTIFICATE_SUBJECT: [
+        'назва предмету в свідоцтві',
+        'предмет в свідоцтві'
+      ],
+      GROUP: [
+        'group',
+        'група',
+        'освітня галузь'
+      ]
+    },
+
+    STUDENTS: {
+      ID: ['id'],
+      CLASS: ['клас'],
+      NAME: [
+        'імʼя прізвище',
+        'ім’я прізвище',
+        'імя прізвище',
+        'name'
+      ]
+    }
   }
+};
+
+const STATUS = {
+  CREATED: 'СТВОРЕНО',
+  SKIPPED: 'ПРОПУЩЕНО',
+  ERROR: 'ПОМИЛКА',
+  STACK: 'STACK'
 };
 
 function onOpen() {
   SpreadsheetApp.getUi()
-    .createMenu('Журнали')
-    .addItem('Створити вкладки з Предмети', 'createSubjectSheetsFromSubjectsList')
-    .addItem('Пересоздати вкладки з Предмети', 'recreateSubjectSheetsFromSubjectsList')
+    .createMenu(CONFIG.UI.MENU)
+    .addItem(CONFIG.UI.CREATE, 'createSubjectSheetsFromSubjectsList')
+    .addItem(CONFIG.UI.RECREATE, 'recreateSubjectSheetsFromSubjectsList')
     .addToUi();
 }
 
 function createSubjectSheetsFromSubjectsList() {
-  buildSubjectSheets(false);
+  JournalCreationApp.run({ recreateExisting: false });
 }
 
 function recreateSubjectSheetsFromSubjectsList() {
@@ -58,304 +96,562 @@ function recreateSubjectSheetsFromSubjectsList() {
 
   if (response !== ui.Button.YES) return;
 
-  buildSubjectSheets(true);
+  JournalCreationApp.run({ recreateExisting: true });
 }
 
-function buildSubjectSheets(recreateExisting) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const log = [];
+const JournalCreationApp = {
+  run(options) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const log = new LogWriter();
 
-  try {
-    const templateSheet = getRequiredSheet(ss, CONFIG.TEMPLATE_SHEET_NAME);
-    const studentsSheet = getRequiredSheet(ss, CONFIG.STUDENTS_SHEET_NAME);
-    const subjectsSheet = getRequiredSheet(ss, CONFIG.SUBJECTS_SHEET_NAME);
+    try {
+      const context = loadContext(ss);
+      const result = createJournalSheets(context, options, log);
 
-    const students = readStudents(studentsSheet);
-    const subjects = readSubjectsList(subjectsSheet);
-    const templateInfo = analyzeTemplate(templateSheet);
+      log.writeTo(ss);
 
-    if (students.length === 0) {
-      throw new Error('Не знайдено учнів у вкладці "' + CONFIG.STUDENTS_SHEET_NAME + '".');
-    }
+      alertUser(
+        'Готово.\n' +
+        'Створено вкладок: ' + result.created + '\n' +
+        'Пропущено: ' + result.skipped + '\n' +
+        'Деталі дивись у вкладці ' + CONFIG.SHEETS.LOG
+      );
+    } catch (error) {
+      log.error(error);
+      log.writeTo(ss);
 
-    if (subjects.length === 0) {
-      throw new Error('Не знайдено предметів у вкладці "' + CONFIG.SUBJECTS_SHEET_NAME + '".');
-    }
-
-    let created = 0;
-    let skipped = 0;
-
-    subjects.forEach(subject => {
-      const sheetName = makeSafeSheetName(subject.journalSubject);
-
-      if (isSystemSheetName(sheetName)) {
-        log.push([subject.journalSubject, 'ПРОПУЩЕНО', 'Назва збігається зі службовою вкладкою']);
-        skipped++;
-        return;
-      }
-
-      const existingSheet = getSheetByNameLoose(ss, sheetName);
-
-      if (existingSheet && !recreateExisting) {
-        log.push([subject.journalSubject, 'ПРОПУЩЕНО', 'Вкладка вже існує']);
-        skipped++;
-        return;
-      }
-
-      if (existingSheet && recreateExisting) {
-        ss.deleteSheet(existingSheet);
-      }
-
-      const groupTemplate = findTemplateByGroup(templateInfo, subject.group);
-
-      if (!groupTemplate) {
-        log.push([
-          subject.journalSubject,
-          'ПРОПУЩЕНО',
-          'Не знайдено шаблон у Template для Group:',
-          subject.group
-        ]);
-        skipped++;
-        return;
-      }
-
-      const newSheet = templateSheet.copyTo(ss);
-      newSheet.setName(sheetName);
-
-      fillSubjectSheetFromTemplateBlock(
-        templateSheet,
-        newSheet,
-        subject,
-        students,
-        templateInfo,
-        groupTemplate
+      alertUser(
+        'Помилка: ' + error.message + '\n\n' +
+        'Деталі дивись у вкладці ' + CONFIG.SHEETS.LOG
       );
 
-      created++;
-
-      log.push([
-        subject.journalSubject,
-        'СТВОРЕНО',
-        'Group: ' + subject.group,
-        'Висота блоку учня: ' + groupTemplate.blockHeight
-      ]);
-    });
-
-    writeLog(ss, log);
-
-    SpreadsheetApp.getUi().alert(
-      'Готово.\nСтворено вкладок: ' + created +
-      '\nПропущено: ' + skipped +
-      '\nДеталі дивись у вкладці ' + CONFIG.LOG_SHEET_NAME
-    );
-
-  } catch (error) {
-    log.push(['ПОМИЛКА', error.message]);
-    log.push(['STACK', error.stack || '']);
-
-    writeLog(ss, log);
-
-    SpreadsheetApp.getUi().alert(
-      'Помилка: ' + error.message + '\n\nДеталі дивись у вкладці ' + CONFIG.LOG_SHEET_NAME
-    );
-
-    throw error;
-  }
-}
-
-function fillSubjectSheetFromTemplateBlock(
-  templateSheet,
-  sheet,
-  subject,
-  students,
-  templateInfo,
-  groupTemplate
-) {
-  replaceSubjectTitle(sheet, subject.journalSubject);
-
-  // Освітня галузь показується вгорі над назвою предмета
-  replaceTopGroupTitle(sheet, subject.group, templateInfo.markerRow);
-
-  const markerRow = templateInfo.markerRow;
-  const lastCol = templateInfo.lastCol;
-  const blockHeight = groupTemplate.blockHeight;
-
-  // В списку учнів освітню галузь НЕ вставляємо
-  const totalRowsNeeded = students.length * blockHeight;
-  const requiredTotalRows = markerRow + totalRowsNeeded;
-
-  ensureSheetRowCount(sheet, requiredTotalRows);
-
-  clearRowsBelowMarker(sheet, markerRow, lastCol);
-
-  if (students.length === 0) return;
-
-  const firstStudentBlockRow = markerRow + 1;
-
-  // Копіюємо шаблон блоку першого учня з відповідної групи Template
-  copyTemplateStudentBlock(
-    templateSheet,
-    sheet,
-    groupTemplate,
-    firstStudentBlockRow,
-    lastCol
-  );
-
-  if (CONFIG.CLEAR_GRADE_VALUES) {
-    clearGradeValuesInStudentBlock(
-      sheet,
-      firstStudentBlockRow,
-      blockHeight,
-      lastCol,
-      templateInfo
-    );
-  }
-
-  setStudentFieldsOnly(
-    sheet,
-    firstStudentBlockRow,
-    blockHeight,
-    templateInfo,
-    students[0]
-  );
-
-  const firstBlockRange = sheet.getRange(
-    firstStudentBlockRow,
-    1,
-    blockHeight,
-    lastCol
-  );
-
-  // Далі копіюємо готовий блок першого учня для всіх інших учнів
-  for (let i = 1; i < students.length; i++) {
-    const targetStartRow = firstStudentBlockRow + i * blockHeight;
-
-    firstBlockRange.copyTo(
-      sheet.getRange(targetStartRow, 1, blockHeight, lastCol),
-      {
-        contentsOnly: false
-      }
-    );
-
-    setStudentFieldsOnly(
-      sheet,
-      targetStartRow,
-      blockHeight,
-      templateInfo,
-      students[i]
-    );
-  }
-
-  sheet.setFrozenRows(markerRow);
-}
-
-function ensureSheetRowCount(sheet, requiredTotalRows) {
-  const currentRows = sheet.getMaxRows();
-
-  if (currentRows < requiredTotalRows) {
-    sheet.insertRowsAfter(
-      currentRows,
-      requiredTotalRows - currentRows
-    );
-  }
-
-  if (currentRows > requiredTotalRows) {
-    const rowsToDelete = currentRows - requiredTotalRows;
-
-    if (rowsToDelete > 0 && requiredTotalRows > 0) {
-      sheet.deleteRows(requiredTotalRows + 1, rowsToDelete);
+      throw error;
     }
   }
+};
+
+function loadContext(ss) {
+  const sheets = {
+    template: getRequiredSheet(ss, CONFIG.SHEETS.TEMPLATE),
+    students: getRequiredSheet(ss, CONFIG.SHEETS.STUDENTS),
+    subjects: getRequiredSheet(ss, CONFIG.SHEETS.SUBJECTS)
+  };
+
+  const data = {
+    students: StudentRepository.read(sheets.students),
+    subjects: SubjectRepository.read(sheets.subjects),
+    template: TemplateRepository.analyze(sheets.template)
+  };
+
+  assertNotEmpty(data.students, 'Не знайдено учнів у вкладці "' + CONFIG.SHEETS.STUDENTS + '".');
+  assertNotEmpty(data.subjects, 'Не знайдено предметів у вкладці "' + CONFIG.SHEETS.SUBJECTS + '".');
+
+  return { ss, sheets, data };
 }
 
-function copyTemplateStudentBlock(templateSheet, targetSheet, groupTemplate, targetStartRow, lastCol) {
-  const sourceRange = templateSheet.getRange(
-    groupTemplate.blockStartRow,
-    1,
-    groupTemplate.blockHeight,
-    lastCol
-  );
+function createJournalSheets(context, options, log) {
+  let created = 0;
+  let skipped = 0;
 
-  const targetRange = targetSheet.getRange(
-    targetStartRow,
-    1,
-    groupTemplate.blockHeight,
-    lastCol
-  );
+  context.data.subjects.forEach(subject => {
+    const result = createOneJournalSheet(context, subject, options, log);
 
-  sourceRange.copyTo(targetRange, {
-    contentsOnly: false
+    if (result.created) created++;
+    if (result.skipped) skipped++;
   });
 
-  for (let i = 0; i < groupTemplate.blockHeight; i++) {
-    targetSheet.setRowHeight(
-      targetStartRow + i,
-      templateSheet.getRowHeight(groupTemplate.blockStartRow + i)
+  return { created, skipped };
+}
+
+function createOneJournalSheet(context, subject, options, log) {
+  const sheetName = makeSafeSheetName(subject.journalSubject);
+
+  if (isSystemSheetName(sheetName)) {
+    log.row(subject.journalSubject, STATUS.SKIPPED, 'Назва збігається зі службовою вкладкою');
+    return { skipped: true };
+  }
+
+  const existingSheet = findSheetByName(context.ss, sheetName);
+
+  if (existingSheet && !options.recreateExisting) {
+    log.row(subject.journalSubject, STATUS.SKIPPED, 'Вкладка вже існує');
+    return { skipped: true };
+  }
+
+  const templateBlock = TemplateRepository.findByGroup(context.data.template, subject.group);
+
+  if (!templateBlock) {
+    log.row(
+      subject.journalSubject,
+      STATUS.SKIPPED,
+      'Не знайдено шаблон у Template для Group:',
+      subject.group
     );
+
+    return { skipped: true };
+  }
+
+  if (existingSheet && options.recreateExisting) {
+    context.ss.deleteSheet(existingSheet);
+  }
+
+  const targetSheet = context.sheets.template.copyTo(context.ss);
+  targetSheet.setName(sheetName);
+
+  JournalSheetBuilder.build({
+    sourceTemplateSheet: context.sheets.template,
+    targetSheet,
+    subject,
+    students: context.data.students,
+    templateInfo: context.data.template,
+    templateBlock
+  });
+
+  log.row(
+    subject.journalSubject,
+    STATUS.CREATED,
+    'Group: ' + subject.group,
+    'Висота блоку учня: ' + templateBlock.blockHeight
+  );
+
+  return { created: true };
+}
+
+const StudentRepository = {
+  read(sheet) {
+    const values = sheet.getDataRange().getDisplayValues();
+    const headerRowIndex = Header.findRow(values, [
+      CONFIG.HEADERS.STUDENTS.ID,
+      CONFIG.HEADERS.STUDENTS.CLASS,
+      CONFIG.HEADERS.STUDENTS.NAME
+    ]);
+
+    const header = values[headerRowIndex];
+
+    const cols = {
+      id: Header.findCol(header, CONFIG.HEADERS.STUDENTS.ID),
+      className: Header.findCol(header, CONFIG.HEADERS.STUDENTS.CLASS),
+      name: Header.findCol(header, CONFIG.HEADERS.STUDENTS.NAME)
+    };
+
+    return values
+      .slice(headerRowIndex + 1)
+      .map(row => ({
+        id: text(row[cols.id]),
+        className: text(row[cols.className]),
+        name: text(row[cols.name])
+      }))
+      .filter(student => student.id && student.className && student.name)
+      .filter(student => /^\d+$/.test(student.id));
+  }
+};
+
+const SubjectRepository = {
+  read(sheet) {
+    const values = sheet.getDataRange().getDisplayValues();
+    const headerRowIndex = Header.findRow(values, [
+      CONFIG.HEADERS.SUBJECTS.JOURNAL_SUBJECT,
+      CONFIG.HEADERS.SUBJECTS.GROUP
+    ]);
+
+    const header = values[headerRowIndex];
+
+    const cols = {
+      journalSubject: Header.findCol(header, CONFIG.HEADERS.SUBJECTS.JOURNAL_SUBJECT),
+      certificateSubject: Header.findColOptional(header, CONFIG.HEADERS.SUBJECTS.CERTIFICATE_SUBJECT),
+      group: Header.findCol(header, CONFIG.HEADERS.SUBJECTS.GROUP)
+    };
+
+    const subjects = [];
+    const seen = new Set();
+
+    values.slice(headerRowIndex + 1).forEach(row => {
+      const journalSubject = text(row[cols.journalSubject]);
+      const group = text(row[cols.group]);
+
+      if (!journalSubject || !group) return;
+
+      const key = normalize(journalSubject);
+      if (seen.has(key)) return;
+
+      seen.add(key);
+
+      const certificateSubject = cols.certificateSubject === -1
+        ? journalSubject
+        : text(row[cols.certificateSubject]) || journalSubject;
+
+      subjects.push({ journalSubject, certificateSubject, group });
+    });
+
+    return subjects;
+  }
+};
+
+const TemplateRepository = {
+  analyze(sheet) {
+    const values = sheet.getDataRange().getDisplayValues();
+    const markerRowIndex = findTemplateMarkerRow(values);
+
+    if (markerRowIndex === -1) {
+      throw new Error('На вкладці Template не знайдено рядок з кодами STUDENT_ID, CLASS, NAME, DESCRIPTION.');
+    }
+
+    const markerRow = values[markerRowIndex];
+    const markerCols = {
+      studentId: Header.findCol(markerRow, [CONFIG.TEMPLATE.MARKERS.STUDENT_ID]),
+      className: Header.findCol(markerRow, [CONFIG.TEMPLATE.MARKERS.CLASS]),
+      name: Header.findCol(markerRow, [CONFIG.TEMPLATE.MARKERS.NAME]),
+      description: Header.findCol(markerRow, [CONFIG.TEMPLATE.MARKERS.DESCRIPTION])
+    };
+
+    const templateBlocks = detectTemplateBlocks(values, markerRowIndex, markerCols.description);
+
+    if (templateBlocks.length === 0) {
+      throw new Error('У Template не знайдено жодного шаблону учня після рядка "Загальна оцінка".');
+    }
+
+    return {
+      markerRow: markerRowIndex + 1,
+      lastCol: sheet.getLastColumn(),
+      cols: toSheetCols(markerCols),
+      blocks: templateBlocks
+    };
+  },
+
+  findByGroup(templateInfo, groupName) {
+    const groupKey = normalize(groupName);
+    if (!groupKey) return null;
+
+    const exact = templateInfo.blocks.find(block => normalize(block.groupName) === groupKey);
+    if (exact) return exact;
+
+    return templateInfo.blocks.find(block => {
+      const blockGroup = normalize(block.groupName);
+      return blockGroup.includes(groupKey) || groupKey.includes(blockGroup);
+    }) || null;
+  }
+};
+
+const JournalSheetBuilder = {
+  build({ sourceTemplateSheet, targetSheet, subject, students, templateInfo, templateBlock }) {
+    replaceSubjectTitle(targetSheet, subject.journalSubject);
+    replaceTopGroupTitle(targetSheet, subject.group, templateInfo.markerRow);
+
+    const firstStudentRow = templateInfo.markerRow + 1;
+    const blockHeight = templateBlock.blockHeight;
+    const requiredRows = templateInfo.markerRow + students.length * blockHeight;
+
+    ensureSheetRows(targetSheet, requiredRows);
+    clearRowsBelow(targetSheet, templateInfo.markerRow, templateInfo.lastCol);
+
+    if (students.length === 0) return;
+
+    this.copyFirstStudentBlock({
+      sourceTemplateSheet,
+      targetSheet,
+      templateBlock,
+      targetStartRow: firstStudentRow,
+      templateInfo
+    });
+
+    this.setStudentData(targetSheet, firstStudentRow, blockHeight, templateInfo, students[0]);
+
+    const firstBlockRange = targetSheet.getRange(
+      firstStudentRow,
+      1,
+      blockHeight,
+      templateInfo.lastCol
+    );
+
+    for (let i = 1; i < students.length; i++) {
+      const targetStartRow = firstStudentRow + i * blockHeight;
+
+      firstBlockRange.copyTo(
+        targetSheet.getRange(targetStartRow, 1, blockHeight, templateInfo.lastCol),
+        { contentsOnly: false }
+      );
+
+      copyRowHeights(sourceTemplateSheet, targetSheet, templateBlock.blockStartRow, targetStartRow, blockHeight);
+
+      this.setStudentData(targetSheet, targetStartRow, blockHeight, templateInfo, students[i]);
+    }
+
+    targetSheet.setFrozenRows(templateInfo.markerRow);
+  },
+
+  copyFirstStudentBlock({ sourceTemplateSheet, targetSheet, templateBlock, targetStartRow, templateInfo }) {
+    const sourceRange = sourceTemplateSheet.getRange(
+      templateBlock.blockStartRow,
+      1,
+      templateBlock.blockHeight,
+      templateInfo.lastCol
+    );
+
+    const targetRange = targetSheet.getRange(
+      targetStartRow,
+      1,
+      templateBlock.blockHeight,
+      templateInfo.lastCol
+    );
+
+    sourceRange.copyTo(targetRange, { contentsOnly: false });
+
+    copyRowHeights(
+      sourceTemplateSheet,
+      targetSheet,
+      templateBlock.blockStartRow,
+      targetStartRow,
+      templateBlock.blockHeight
+    );
+
+    if (CONFIG.TEMPLATE.CLEAR_GRADE_VALUES) {
+      clearEditableValues(targetSheet, targetStartRow, templateBlock.blockHeight, templateInfo);
+    }
+  },
+
+  setStudentData(sheet, startRow, blockHeight, templateInfo, student) {
+    setMergedValue(sheet, startRow, blockHeight, templateInfo.cols.studentId, student.id);
+    setMergedValue(sheet, startRow, blockHeight, templateInfo.cols.className, student.className);
+    setMergedValue(sheet, startRow, blockHeight, templateInfo.cols.name, student.name);
+  }
+};
+
+const Header = {
+  findRow(values, requiredHeaderGroups) {
+    for (let r = 0; r < values.length; r++) {
+      const normalizedRow = values[r].map(normalize);
+
+      const hasAllHeaders = requiredHeaderGroups.every(group => {
+        return this.findColInNormalizedRow(normalizedRow, group) !== -1;
+      });
+
+      if (hasAllHeaders) return r;
+    }
+
+    throw new Error('Не знайдено рядок із потрібними заголовками.');
+  },
+
+  findCol(row, aliases) {
+    const normalizedRow = row.map(normalize);
+    const col = this.findColInNormalizedRow(normalizedRow, aliases);
+
+    if (col === -1) {
+      throw new Error('Не знайдено колонку: ' + aliases.join(' / '));
+    }
+
+    return col;
+  },
+
+  findColOptional(row, aliases) {
+    return this.findColInNormalizedRow(row.map(normalize), aliases);
+  },
+
+  findColInNormalizedRow(normalizedRow, aliases) {
+    const normalizedAliases = aliases.map(normalize);
+
+    for (let c = 0; c < normalizedRow.length; c++) {
+      const cell = normalizedRow[c];
+
+      if (normalizedAliases.some(alias => cell === alias || cell.includes(alias))) {
+        return c;
+      }
+    }
+
+    return -1;
+  }
+};
+
+function detectTemplateBlocks(values, markerRowIndex, descriptionColIndex) {
+  const blocks = [];
+  const usedGroups = new Set();
+
+  for (let r = markerRowIndex + 1; r < values.length; r++) {
+    const description = normalize(values[r][descriptionColIndex]);
+
+    if (description !== normalize(CONFIG.TEMPLATE.TOTAL_LABEL)) continue;
+
+    const groupRowIndex = findGroupHeaderAboveTotalRow(
+      values,
+      markerRowIndex,
+      r,
+      descriptionColIndex
+    );
+
+    if (groupRowIndex === -1) continue;
+
+    const groupName = getFirstNonEmptyCell(values[groupRowIndex]);
+    const groupKey = normalize(groupName);
+
+    if (!groupName || usedGroups.has(groupKey)) continue;
+
+    usedGroups.add(groupKey);
+
+    const blockEndRowIndex = detectStudentBlockEndRow(
+      values,
+      r,
+      descriptionColIndex
+    );
+
+    blocks.push({
+      groupName,
+      groupRow: groupRowIndex + 1,
+      groupLabelCol: getFirstNonEmptyCol(values[groupRowIndex]) + 1,
+      blockStartRow: r + 1,
+      blockEndRow: blockEndRowIndex + 1,
+      blockHeight: blockEndRowIndex - r + 1
+    });
+  }
+
+  return blocks;
+}
+
+function findGroupHeaderAboveTotalRow(values, markerRowIndex, totalRowIndex, descriptionColIndex) {
+  for (let r = totalRowIndex - 1; r > markerRowIndex; r--) {
+    const rowText = normalize(values[r].join(' '));
+    const description = normalize(values[r][descriptionColIndex]);
+
+    if (!rowText) continue;
+    if (description) continue;
+    if (rowText.includes('student_id')) continue;
+    if (rowText.includes('description')) continue;
+    if (rowText.includes(normalize(CONFIG.TEMPLATE.TITLE_TEXT))) continue;
+
+    return r;
+  }
+
+  return -1;
+}
+
+function detectStudentBlockEndRow(values, totalRowIndex, descriptionColIndex) {
+  let endRow = totalRowIndex;
+
+  for (let r = totalRowIndex; r < values.length; r++) {
+    const description = text(values[r][descriptionColIndex]);
+    const rowText = normalize(values[r].join(' '));
+
+    if (!description) break;
+
+    if (r > totalRowIndex && rowText.includes('student_id')) break;
+    if (r > totalRowIndex && rowText.includes('освітня галузь')) break;
+
+    endRow = r;
+  }
+
+  return endRow;
+}
+
+function findTemplateMarkerRow(values) {
+  const requiredMarkers = [
+    [CONFIG.TEMPLATE.MARKERS.STUDENT_ID],
+    [CONFIG.TEMPLATE.MARKERS.CLASS],
+    [CONFIG.TEMPLATE.MARKERS.NAME],
+    [CONFIG.TEMPLATE.MARKERS.DESCRIPTION]
+  ];
+
+  try {
+    return Header.findRow(values, requiredMarkers);
+  } catch (error) {
+    return -1;
   }
 }
 
-function clearGradeValuesInStudentBlock(sheet, startRow, blockHeight, lastCol, templateInfo) {
-  const range = sheet.getRange(startRow, 1, blockHeight, lastCol);
+function replaceSubjectTitle(sheet, subjectName) {
+  replaceTextInUsedRange(sheet, CONFIG.TEMPLATE.TITLE_TEXT, subjectName);
+}
+
+function replaceTopGroupTitle(sheet, groupName, markerRow) {
+  if (!groupName) return;
+
+  const topRows = Math.max(markerRow - 1, 1);
+  const range = sheet.getRange(1, 1, topRows, sheet.getLastColumn());
+  const values = range.getDisplayValues();
+
+  for (let r = 0; r < values.length; r++) {
+    for (let c = 0; c < values[r].length; c++) {
+      const cell = normalize(values[r][c]);
+
+      if (cell.includes('освітня галузь')) {
+        sheet.getRange(r + 1, c + 1).setValue(groupName);
+        return;
+      }
+    }
+  }
+
+  sheet.getRange(1, 1).setValue(groupName);
+}
+
+function replaceTextInUsedRange(sheet, searchText, replacement) {
+  const range = sheet.getDataRange();
+  const values = range.getDisplayValues();
+  const needle = normalize(searchText);
+
+  for (let r = 0; r < values.length; r++) {
+    for (let c = 0; c < values[r].length; c++) {
+      if (normalize(values[r][c]) === needle) {
+        sheet.getRange(r + 1, c + 1).setValue(replacement);
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function ensureSheetRows(sheet, requiredRows) {
+  const currentRows = sheet.getMaxRows();
+
+  if (currentRows < requiredRows) {
+    sheet.insertRowsAfter(currentRows, requiredRows - currentRows);
+    return;
+  }
+
+  if (currentRows > requiredRows) {
+    sheet.deleteRows(requiredRows + 1, currentRows - requiredRows);
+  }
+}
+
+function clearRowsBelow(sheet, markerRow, lastCol) {
+  const rowsToClear = sheet.getMaxRows() - markerRow;
+
+  if (rowsToClear <= 0) return;
+
+  const range = sheet.getRange(markerRow + 1, 1, rowsToClear, lastCol);
+
+  range.breakApart();
+  range.clearContent();
+  range.clearFormat();
+  range.clearDataValidations();
+}
+
+function clearEditableValues(sheet, startRow, blockHeight, templateInfo) {
+  const range = sheet.getRange(startRow, 1, blockHeight, templateInfo.lastCol);
 
   range.breakApart();
 
   const values = range.getValues();
   const formulas = range.getFormulas();
-
   const protectedCols = new Set([
     templateInfo.cols.studentId,
-    templateInfo.cols.class,
+    templateInfo.cols.className,
     templateInfo.cols.name,
     templateInfo.cols.description
   ]);
 
-  const newValues = values.map((row, r) => {
+  const clearedValues = values.map((row, r) => {
     return row.map((cell, c) => {
-      const colNumber = c + 1;
+      const col = c + 1;
 
-      if (formulas[r][c]) {
-        return formulas[r][c];
-      }
-
-      if (protectedCols.has(colNumber)) {
-        return cell;
-      }
+      if (formulas[r][c]) return formulas[r][c];
+      if (protectedCols.has(col)) return cell;
 
       return '';
     });
   });
 
-  range.setValues(newValues);
+  range.setValues(clearedValues);
 }
 
-function setStudentFieldsOnly(sheet, startRow, blockHeight, templateInfo, student) {
-  mergeStudentField(
-    sheet,
-    startRow,
-    blockHeight,
-    templateInfo.cols.studentId,
-    student.id
-  );
-
-  mergeStudentField(
-    sheet,
-    startRow,
-    blockHeight,
-    templateInfo.cols.class,
-    student.class
-  );
-
-  mergeStudentField(
-    sheet,
-    startRow,
-    blockHeight,
-    templateInfo.cols.name,
-    student.name
-  );
-}
-
-function mergeStudentField(sheet, startRow, blockHeight, col, value) {
+function setMergedValue(sheet, startRow, blockHeight, col, value) {
   const range = sheet.getRange(startRow, col, blockHeight, 1);
 
   range.breakApart();
@@ -370,370 +666,53 @@ function mergeStudentField(sheet, startRow, blockHeight, col, value) {
     .setHorizontalAlignment('center');
 }
 
-function clearRowsBelowMarker(sheet, markerRow, lastCol) {
-  const rowsToClear = sheet.getMaxRows() - markerRow;
-
-  if (rowsToClear <= 0) return;
-
-  const range = sheet.getRange(markerRow + 1, 1, rowsToClear, lastCol);
-
-  range.breakApart();
-  range.clearContent();
-  range.clearFormat();
-  range.clearDataValidations();
-}
-
-function analyzeTemplate(sheet) {
-  const values = sheet.getDataRange().getDisplayValues();
-
-  const markerRowIndex = findTemplateMarkerRow(values);
-
-  if (markerRowIndex === -1) {
-    throw new Error(
-      'На вкладці Template не знайдено рядок з кодами STUDENT_ID, CLASS, NAME, DESCRIPTION.'
+function copyRowHeights(sourceSheet, targetSheet, sourceStartRow, targetStartRow, rowCount) {
+  for (let i = 0; i < rowCount; i++) {
+    targetSheet.setRowHeight(
+      targetStartRow + i,
+      sourceSheet.getRowHeight(sourceStartRow + i)
     );
   }
-
-  const markerRow = values[markerRowIndex];
-
-  const studentIdColIndex = findColByExactText(markerRow, CONFIG.TEMPLATE_MARKERS.STUDENT_ID);
-  const classColIndex = findColByExactText(markerRow, CONFIG.TEMPLATE_MARKERS.CLASS);
-  const nameColIndex = findColByExactText(markerRow, CONFIG.TEMPLATE_MARKERS.NAME);
-  const descriptionColIndex = findColByExactText(markerRow, CONFIG.TEMPLATE_MARKERS.DESCRIPTION);
-
-  const groupTemplates = detectGroupTemplates(values, markerRowIndex, descriptionColIndex);
-
-  if (groupTemplates.length === 0) {
-    throw new Error('У Template не знайдено жодної групи з текстом "ОСВІТНЯ ГАЛУЗЬ".');
-  }
-
-  return {
-    markerRow: markerRowIndex + 1,
-    lastCol: sheet.getLastColumn(),
-
-    cols: {
-      studentId: studentIdColIndex + 1,
-      class: classColIndex + 1,
-      name: nameColIndex + 1,
-      description: descriptionColIndex + 1
-    },
-
-    groupTemplates
-  };
 }
 
-function detectGroupTemplates(values, markerRowIndex, descriptionColIndex) {
-  const groupRows = [];
-
-  for (let r = markerRowIndex + 1; r < values.length; r++) {
-    const rowText = normalize(values[r].join(' '));
-
-    if (rowText.includes('освітня галузь')) {
-      groupRows.push(r);
-    }
+class LogWriter {
+  constructor() {
+    this.rows = [];
   }
 
-  const templates = [];
-
-  groupRows.forEach((groupRowIndex, index) => {
-    const nextGroupRowIndex = index + 1 < groupRows.length
-      ? groupRows[index + 1]
-      : values.length;
-
-    const groupName = getFirstNonEmptyCell(values[groupRowIndex]);
-    const groupLabelCol = getFirstNonEmptyCol(values[groupRowIndex]) + 1;
-
-    const totalRowIndex = findFirstTotalRowBetween(
-      values,
-      groupRowIndex + 1,
-      nextGroupRowIndex - 1,
-      descriptionColIndex
-    );
-
-    if (totalRowIndex === -1) return;
-
-    const blockEndRowIndex = detectTemplateBlockEndRow(
-      values,
-      totalRowIndex,
-      nextGroupRowIndex - 1,
-      descriptionColIndex
-    );
-
-    if (blockEndRowIndex < totalRowIndex) return;
-
-    templates.push({
-      groupName,
-      groupRow: groupRowIndex + 1,
-      groupLabelCol,
-      blockStartRow: totalRowIndex + 1,
-      blockEndRow: blockEndRowIndex + 1,
-      blockHeight: blockEndRowIndex - totalRowIndex + 1
-    });
-  });
-
-  return templates;
-}
-
-function findFirstTotalRowBetween(values, startRowIndex, endRowIndex, descriptionColIndex) {
-  const safeEnd = Math.min(endRowIndex, values.length - 1);
-
-  for (let r = startRowIndex; r <= safeEnd; r++) {
-    const description = normalize(values[r][descriptionColIndex]);
-
-    if (description === normalize(CONFIG.TOTAL_LABEL)) {
-      return r;
-    }
+  row(...values) {
+    this.rows.push(values);
   }
 
-  return -1;
-}
+  error(error) {
+    this.row(STATUS.ERROR, error.message);
+    this.row(STATUS.STACK, error.stack || '');
+  }
 
-function detectTemplateBlockEndRow(values, totalRowIndex, endLimitRowIndex, descriptionColIndex) {
-  let endRow = totalRowIndex;
+  writeTo(spreadsheet) {
+    let sheet = spreadsheet.getSheetByName(CONFIG.SHEETS.LOG);
 
-  for (let r = totalRowIndex; r <= endLimitRowIndex; r++) {
-    const description = String(values[r][descriptionColIndex] || '').trim();
-
-    if (!description) break;
-
-    const rowText = normalize(values[r].join(' '));
-
-    if (r > totalRowIndex && rowText.includes('освітня галузь')) {
-      break;
+    if (!sheet) {
+      sheet = spreadsheet.insertSheet(CONFIG.SHEETS.LOG);
     }
 
-    endRow = r;
-  }
+    sheet.clear();
 
-  return endRow;
-}
-
-function findTemplateByGroup(templateInfo, groupName) {
-  const groupKey = normalize(groupName);
-
-  if (!groupKey) return null;
-
-  const exact = templateInfo.groupTemplates.find(template => {
-    return normalize(template.groupName) === groupKey;
-  });
-
-  if (exact) return exact;
-
-  const partial = templateInfo.groupTemplates.find(template => {
-    const templateGroup = normalize(template.groupName);
-
-    return templateGroup.includes(groupKey) || groupKey.includes(templateGroup);
-  });
-
-  return partial || null;
-}
-
-function replaceTopGroupTitle(sheet, groupName, markerRow) {
-  if (!groupName) return;
-
-  const topRowsCount = Math.max(markerRow - 1, 1);
-  const range = sheet.getRange(1, 1, topRowsCount, sheet.getLastColumn());
-  const values = range.getDisplayValues();
-
-  for (let r = 0; r < values.length; r++) {
-    for (let c = 0; c < values[r].length; c++) {
-      const cellText = normalize(values[r][c]);
-
-      if (cellText.includes('освітня галузь')) {
-        sheet.getRange(r + 1, c + 1).setValue(groupName);
-        return;
-      }
-    }
-  }
-
-  sheet.getRange(1, 1).setValue(groupName);
-}
-
-function readSubjectsList(sheet) {
-  const values = sheet.getDataRange().getDisplayValues();
-
-  const headerRowIndex = findSubjectsHeaderRow(values);
-
-  if (headerRowIndex === -1) {
-    throw new Error('Не знайдено заголовки у вкладці "Предмети".');
-  }
-
-  const headerRow = values[headerRowIndex];
-
-  const journalSubjectCol = findColByHeaderLike(headerRow, CONFIG.SUBJECT_HEADERS.JOURNAL_SUBJECT);
-  const certificateSubjectCol = findColByHeaderLikeOptional(headerRow, CONFIG.SUBJECT_HEADERS.CERTIFICATE_SUBJECT);
-  const groupCol = findColByHeaderLike(headerRow, CONFIG.SUBJECT_HEADERS.GROUP);
-
-  const subjects = [];
-  const seen = new Set();
-
-  for (let r = headerRowIndex + 1; r < values.length; r++) {
-    const journalSubject = String(values[r][journalSubjectCol] || '').trim();
-
-    if (!journalSubject) continue;
-
-    const certificateSubject = certificateSubjectCol !== -1
-      ? String(values[r][certificateSubjectCol] || '').trim()
-      : journalSubject;
-
-    const group = String(values[r][groupCol] || '').trim();
-
-    if (!group) continue;
-
-    const key = normalize(journalSubject);
-
-    if (seen.has(key)) continue;
-
-    seen.add(key);
-
-    subjects.push({
-      journalSubject,
-      certificateSubject: certificateSubject || journalSubject,
-      group
-    });
-  }
-
-  return subjects;
-}
-
-function findSubjectsHeaderRow(values) {
-  for (let r = 0; r < values.length; r++) {
-    const row = values[r].map(normalize);
-
-    const hasSubject = hasAnyHeader(row, CONFIG.SUBJECT_HEADERS.JOURNAL_SUBJECT);
-    const hasGroup = hasAnyHeader(row, CONFIG.SUBJECT_HEADERS.GROUP);
-
-    if (hasSubject && hasGroup) {
-      return r;
-    }
-  }
-
-  return -1;
-}
-
-function readStudents(sheet) {
-  const values = sheet.getDataRange().getDisplayValues();
-
-  const headerRowIndex = findStudentsHeaderRow(values);
-
-  if (headerRowIndex === -1) {
-    throw new Error('Не знайдено заголовки id, клас, Імʼя Прізвище.');
-  }
-
-  const headerRow = values[headerRowIndex];
-
-  const idCol = findColByHeaderLike(headerRow, ['id']);
-  const classCol = findColByHeaderLike(headerRow, ['клас']);
-  const nameCol = findColByHeaderLike(headerRow, [
-    'імʼя прізвище',
-    'ім’я прізвище',
-    'імя прізвище',
-    'name'
-  ]);
-
-  const students = [];
-
-  for (let r = headerRowIndex + 1; r < values.length; r++) {
-    const id = String(values[r][idCol] || '').trim();
-    const studentClass = String(values[r][classCol] || '').trim();
-    const name = String(values[r][nameCol] || '').trim();
-
-    if (!id || !studentClass || !name) continue;
-    if (!/^\d+$/.test(id)) continue;
-
-    students.push({
-      id,
-      class: studentClass,
-      name
-    });
-  }
-
-  return students;
-}
-
-function findStudentsHeaderRow(values) {
-  for (let r = 0; r < values.length; r++) {
-    const row = values[r].map(normalize);
-
-    const hasId = row.some(cell => cell === 'id');
-    const hasClass = row.some(cell => cell === 'клас');
-    const hasName = row.some(cell =>
-      cell.includes('ім') ||
-      cell.includes('прізвище') ||
-      cell.includes('name')
-    );
-
-    if (hasId && hasClass && hasName) {
-      return r;
-    }
-  }
-
-  return -1;
-}
-
-function findTemplateMarkerRow(values) {
-  for (let r = 0; r < values.length; r++) {
-    const row = values[r].map(normalize);
-
-    const hasStudentId = row.includes(normalize(CONFIG.TEMPLATE_MARKERS.STUDENT_ID));
-    const hasClass = row.includes(normalize(CONFIG.TEMPLATE_MARKERS.CLASS));
-    const hasName = row.includes(normalize(CONFIG.TEMPLATE_MARKERS.NAME));
-    const hasDescription = row.includes(normalize(CONFIG.TEMPLATE_MARKERS.DESCRIPTION));
-
-    if (hasStudentId && hasClass && hasName && hasDescription) {
-      return r;
-    }
-  }
-
-  return -1;
-}
-
-function replaceSubjectTitle(sheet, subjectName) {
-  const range = sheet.getDataRange();
-  const values = range.getDisplayValues();
-
-  for (let r = 0; r < values.length; r++) {
-    for (let c = 0; c < values[r].length; c++) {
-      if (normalize(values[r][c]) === normalize(CONFIG.TEMPLATE_TITLE_TEXT)) {
-        sheet.getRange(r + 1, c + 1).setValue(subjectName);
-        return;
-      }
-    }
-  }
-}
-
-function writeLog(spreadsheet, log) {
-  let sheet = spreadsheet.getSheetByName(CONFIG.LOG_SHEET_NAME);
-
-  if (!sheet) {
-    sheet = spreadsheet.insertSheet(CONFIG.LOG_SHEET_NAME);
-  }
-
-  sheet.clear();
-
-  if (log.length === 0) {
-    sheet.getRange(1, 1).setValue('Лог порожній');
-    return;
-  }
-
-  const width = 6;
-
-  const prepared = log.map(row => {
-    const arr = Array.isArray(row) ? row : [row];
-
-    while (arr.length < width) {
-      arr.push('');
+    if (this.rows.length === 0) {
+      sheet.getRange(1, 1).setValue('Лог порожній');
+      return;
     }
 
-    return arr.slice(0, width);
-  });
+    const width = Math.max(...this.rows.map(row => row.length), 1);
+    const prepared = this.rows.map(row => padRow(row, width));
 
-  sheet.getRange(1, 1, prepared.length, width).setValues(prepared);
-  sheet.autoResizeColumns(1, width);
+    sheet.getRange(1, 1, prepared.length, width).setValues(prepared);
+    sheet.autoResizeColumns(1, width);
+  }
 }
 
-function getRequiredSheet(ss, sheetName) {
-  const sheet = ss.getSheetByName(sheetName);
+function getRequiredSheet(spreadsheet, sheetName) {
+  const sheet = spreadsheet.getSheetByName(sheetName);
 
   if (!sheet) {
     throw new Error('Не знайдено вкладку: ' + sheetName);
@@ -742,96 +721,69 @@ function getRequiredSheet(ss, sheetName) {
   return sheet;
 }
 
-function getSheetByNameLoose(ss, sheetName) {
-  const exact = ss.getSheetByName(sheetName);
+function findSheetByName(spreadsheet, sheetName) {
+  const exact = spreadsheet.getSheetByName(sheetName);
 
   if (exact) return exact;
 
   const needle = normalize(sheetName);
 
-  return ss.getSheets().find(sheet => normalize(sheet.getName()) === needle) || null;
+  return spreadsheet
+    .getSheets()
+    .find(sheet => normalize(sheet.getName()) === needle) || null;
 }
 
 function isSystemSheetName(sheetName) {
-  const systemNames = [
-    CONFIG.TEMPLATE_SHEET_NAME,
-    CONFIG.STUDENTS_SHEET_NAME,
-    CONFIG.SUBJECTS_SHEET_NAME,
-    CONFIG.LOG_SHEET_NAME,
+  const systemSheetNames = [
+    CONFIG.SHEETS.TEMPLATE,
+    CONFIG.SHEETS.STUDENTS,
+    CONFIG.SHEETS.SUBJECTS,
+    CONFIG.SHEETS.LOG,
     'Маппінг предметів'
   ];
 
-  return systemNames.some(name => normalize(name) === normalize(sheetName));
-}
-
-function findColByExactText(row, text) {
-  const needle = normalize(text);
-
-  for (let c = 0; c < row.length; c++) {
-    if (normalize(row[c]) === needle) {
-      return c;
-    }
-  }
-
-  throw new Error('Не знайдено колонку з текстом: ' + text);
-}
-
-function findColByHeaderLike(row, variants) {
-  const normalizedVariants = variants.map(normalize);
-
-  for (let c = 0; c < row.length; c++) {
-    const cell = normalize(row[c]);
-
-    if (normalizedVariants.some(v => cell === v || cell.includes(v))) {
-      return c;
-    }
-  }
-
-  throw new Error('Не знайдено колонку: ' + variants.join(' / '));
-}
-
-function findColByHeaderLikeOptional(row, variants) {
-  const normalizedVariants = variants.map(normalize);
-
-  for (let c = 0; c < row.length; c++) {
-    const cell = normalize(row[c]);
-
-    if (normalizedVariants.some(v => cell === v || cell.includes(v))) {
-      return c;
-    }
-  }
-
-  return -1;
-}
-
-function findIndexByHeaderLike(normalizedRow, variants) {
-  const normalizedVariants = variants.map(normalize);
-
-  for (let c = 0; c < normalizedRow.length; c++) {
-    const cell = normalizedRow[c];
-
-    if (normalizedVariants.some(v => cell === v || cell.includes(v))) {
-      return c;
-    }
-  }
-
-  return -1;
-}
-
-function hasAnyHeader(normalizedRow, variants) {
-  return findIndexByHeaderLike(normalizedRow, variants) !== -1;
+  return systemSheetNames.some(name => normalize(name) === normalize(sheetName));
 }
 
 function makeSafeSheetName(name) {
-  return String(name)
-    .trim()
+  return text(name)
     .replace(/[\\/?*\[\]:]/g, '-')
     .substring(0, 99);
 }
 
+function toSheetCols(zeroBasedCols) {
+  const result = {};
+
+  Object.keys(zeroBasedCols).forEach(key => {
+    result[key] = zeroBasedCols[key] + 1;
+  });
+
+  return result;
+}
+
+function assertNotEmpty(items, message) {
+  if (!items || items.length === 0) {
+    throw new Error(message);
+  }
+}
+
+function alertUser(message) {
+  SpreadsheetApp.getUi().alert(message);
+}
+
+function padRow(row, width) {
+  const result = row.slice();
+
+  while (result.length < width) {
+    result.push('');
+  }
+
+  return result;
+}
+
 function getFirstNonEmptyCell(row) {
   for (let c = 0; c < row.length; c++) {
-    const value = String(row[c] || '').trim();
+    const value = text(row[c]);
 
     if (value) return value;
   }
@@ -841,17 +793,18 @@ function getFirstNonEmptyCell(row) {
 
 function getFirstNonEmptyCol(row) {
   for (let c = 0; c < row.length; c++) {
-    const value = String(row[c] || '').trim();
-
-    if (value) return c;
+    if (text(row[c])) return c;
   }
 
   return 0;
 }
 
+function text(value) {
+  return String(value || '').trim();
+}
+
 function normalize(value) {
-  return String(value || '')
-    .trim()
+  return text(value)
     .toLowerCase()
     .replace(/[’ʼ`´]/g, "'")
     .replace(/[–—]/g, '-')
