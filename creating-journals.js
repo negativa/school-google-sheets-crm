@@ -18,15 +18,25 @@ const CONFIG = {
   },
 
   SUBJECT_HEADERS: {
+    CREATE: [
+      'створити',
+      'створювати',
+      'створити журнал',
+      'create',
+      'checkbox'
+    ],
+
     JOURNAL_SUBJECT: [
       'назва предмету ua',
       'предмет в журналі',
       'предмет'
     ],
+
     CERTIFICATE_SUBJECT: [
       'назва предмету в свідоцтві',
       'предмет в свідоцтві'
     ],
+
     GROUP: [
       'group',
       'група',
@@ -38,8 +48,8 @@ const CONFIG = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Журнали')
-    .addItem('Створити вкладки з Предмети', 'createSubjectSheetsFromSubjectsList')
-    .addItem('Пересоздати вкладки з Предмети', 'recreateSubjectSheetsFromSubjectsList')
+    .addItem('Створити вибрані вкладки', 'createSubjectSheetsFromSubjectsList')
+    .addItem('Пересоздати вибрані вкладки', 'recreateSubjectSheetsFromSubjectsList')
     .addToUi();
 }
 
@@ -51,8 +61,8 @@ function recreateSubjectSheetsFromSubjectsList() {
   const ui = SpreadsheetApp.getUi();
 
   const response = ui.alert(
-    'Пересоздати вкладки?',
-    'Будуть пересоздані тільки вкладки, які є у списку "Предмети". Оцінки на цих вкладках будуть стерті.',
+    'Пересоздати вибрані вкладки?',
+    'Будуть пересоздані тільки ті вкладки, навпроти яких у списку "Предмети" стоїть галочка. Оцінки на цих вкладках будуть стерті.',
     ui.ButtonSet.YES_NO
   );
 
@@ -79,7 +89,11 @@ function buildSubjectSheets(recreateExisting) {
     }
 
     if (subjects.length === 0) {
-      throw new Error('Не знайдено предметів у вкладці "' + CONFIG.SUBJECTS_SHEET_NAME + '".');
+      throw new Error(
+        'Не вибрано жодного предмета. Постав галочку в колонці "Створити" на вкладці "' +
+        CONFIG.SUBJECTS_SHEET_NAME +
+        '".'
+      );
     }
 
     let created = 0;
@@ -89,7 +103,11 @@ function buildSubjectSheets(recreateExisting) {
       const sheetName = makeSafeSheetName(subject.journalSubject);
 
       if (isSystemSheetName(sheetName)) {
-        log.push([subject.journalSubject, 'ПРОПУЩЕНО', 'Назва збігається зі службовою вкладкою']);
+        log.push([
+          subject.journalSubject,
+          'ПРОПУЩЕНО',
+          'Назва збігається зі службовою вкладкою'
+        ]);
         skipped++;
         return;
       }
@@ -97,7 +115,11 @@ function buildSubjectSheets(recreateExisting) {
       const existingSheet = getSheetByNameLoose(ss, sheetName);
 
       if (existingSheet && !recreateExisting) {
-        log.push([subject.journalSubject, 'ПРОПУЩЕНО', 'Вкладка вже існує']);
+        log.push([
+          subject.journalSubject,
+          'ПРОПУЩЕНО',
+          'Вкладка вже існує'
+        ]);
         skipped++;
         return;
       }
@@ -144,9 +166,10 @@ function buildSubjectSheets(recreateExisting) {
     writeLog(ss, log);
 
     SpreadsheetApp.getUi().alert(
-      'Готово.\nСтворено вкладок: ' + created +
-      '\nПропущено: ' + skipped +
-      '\nДеталі дивись у вкладці ' + CONFIG.LOG_SHEET_NAME
+      'Готово.\n' +
+      'Створено вкладок: ' + created + '\n' +
+      'Пропущено: ' + skipped + '\n' +
+      'Деталі дивись у вкладці ' + CONFIG.LOG_SHEET_NAME
     );
 
   } catch (error) {
@@ -156,7 +179,8 @@ function buildSubjectSheets(recreateExisting) {
     writeLog(ss, log);
 
     SpreadsheetApp.getUi().alert(
-      'Помилка: ' + error.message + '\n\nДеталі дивись у вкладці ' + CONFIG.LOG_SHEET_NAME
+      'Помилка: ' + error.message + '\n\n' +
+      'Деталі дивись у вкладці ' + CONFIG.LOG_SHEET_NAME
     );
 
     throw error;
@@ -185,7 +209,6 @@ function fillSubjectSheetFromTemplateBlock(
   const requiredTotalRows = markerRow + totalRowsNeeded;
 
   ensureSheetRowCount(sheet, requiredTotalRows);
-
   clearRowsBelowMarker(sheet, markerRow, lastCol);
 
   if (students.length === 0) return;
@@ -550,33 +573,60 @@ function replaceTopGroupTitle(sheet, groupName, markerRow) {
 }
 
 function readSubjectsList(sheet) {
-  const values = sheet.getDataRange().getDisplayValues();
+  const range = sheet.getDataRange();
 
-  const headerRowIndex = findSubjectsHeaderRow(values);
+  const displayValues = range.getDisplayValues();
+  const rawValues = range.getValues();
+
+  const headerRowIndex = findSubjectsHeaderRow(displayValues);
 
   if (headerRowIndex === -1) {
     throw new Error('Не знайдено заголовки у вкладці "Предмети".');
   }
 
-  const headerRow = values[headerRowIndex];
+  const headerRow = displayValues[headerRowIndex];
 
-  const journalSubjectCol = findColByHeaderLike(headerRow, CONFIG.SUBJECT_HEADERS.JOURNAL_SUBJECT);
-  const certificateSubjectCol = findColByHeaderLikeOptional(headerRow, CONFIG.SUBJECT_HEADERS.CERTIFICATE_SUBJECT);
-  const groupCol = findColByHeaderLike(headerRow, CONFIG.SUBJECT_HEADERS.GROUP);
+  const createCol = findColByHeaderLike(
+    headerRow,
+    CONFIG.SUBJECT_HEADERS.CREATE
+  );
+
+  const journalSubjectCol = findColByHeaderLike(
+    headerRow,
+    CONFIG.SUBJECT_HEADERS.JOURNAL_SUBJECT
+  );
+
+  const certificateSubjectCol = findColByHeaderLikeOptional(
+    headerRow,
+    CONFIG.SUBJECT_HEADERS.CERTIFICATE_SUBJECT
+  );
+
+  const groupCol = findColByHeaderLike(
+    headerRow,
+    CONFIG.SUBJECT_HEADERS.GROUP
+  );
 
   const subjects = [];
   const seen = new Set();
 
-  for (let r = headerRowIndex + 1; r < values.length; r++) {
-    const journalSubject = String(values[r][journalSubjectCol] || '').trim();
+  for (let r = headerRowIndex + 1; r < displayValues.length; r++) {
+    const shouldCreate = isCheckedValue(
+      rawValues[r][createCol],
+      displayValues[r][createCol]
+    );
+
+    // Створюємо тільки ті предмети, де стоїть галочка
+    if (!shouldCreate) continue;
+
+    const journalSubject = String(displayValues[r][journalSubjectCol] || '').trim();
 
     if (!journalSubject) continue;
 
     const certificateSubject = certificateSubjectCol !== -1
-      ? String(values[r][certificateSubjectCol] || '').trim()
+      ? String(displayValues[r][certificateSubjectCol] || '').trim()
       : journalSubject;
 
-    const group = String(values[r][groupCol] || '').trim();
+    const group = String(displayValues[r][groupCol] || '').trim();
 
     if (!group) continue;
 
@@ -600,10 +650,11 @@ function findSubjectsHeaderRow(values) {
   for (let r = 0; r < values.length; r++) {
     const row = values[r].map(normalize);
 
+    const hasCreate = hasAnyHeader(row, CONFIG.SUBJECT_HEADERS.CREATE);
     const hasSubject = hasAnyHeader(row, CONFIG.SUBJECT_HEADERS.JOURNAL_SUBJECT);
     const hasGroup = hasAnyHeader(row, CONFIG.SUBJECT_HEADERS.GROUP);
 
-    if (hasSubject && hasGroup) {
+    if (hasCreate && hasSubject && hasGroup) {
       return r;
     }
   }
@@ -820,6 +871,19 @@ function findIndexByHeaderLike(normalizedRow, variants) {
 
 function hasAnyHeader(normalizedRow, variants) {
   return findIndexByHeaderLike(normalizedRow, variants) !== -1;
+}
+
+function isCheckedValue(rawValue, displayValue) {
+  if (rawValue === true) return true;
+
+  const textValue = normalize(displayValue);
+
+  return (
+    textValue === 'true' ||
+    textValue === 'так' ||
+    textValue === 'yes' ||
+    textValue === '1'
+  );
 }
 
 function makeSafeSheetName(name) {
